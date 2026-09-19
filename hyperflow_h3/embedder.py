@@ -131,6 +131,28 @@ def make_two_time_forward(base_forward, endpoint_forward, gate, shared):
         return t_emb + gate * (r_emb - t_emb)
 
     forward._hyperflow_two_time = True
+    # Keep the captured base reachable: the module attribute outlives any single
+    # ModelPatcher (every clone shares the inner model), so a later install on a
+    # fresh clone while this patch is still resident must unwrap to the true
+    # original instead of wrapping this wrapper -- a wrapper-on-wrapper leaves
+    # the inner one bound to the stale (cleared) step context.
+    forward._hyperflow_base_forward = base_forward
+    return forward
+
+
+def _unwrap_two_time(forward):
+    """Reduce ``forward`` to the first non-HyperFlow forward beneath it, however
+    many HyperFlow wrappers are stacked (loop scenes sharing one module)."""
+    seen = set()
+    while getattr(forward, "_hyperflow_two_time", False):
+        inner = getattr(forward, "_hyperflow_base_forward", None)
+        if inner is None or id(inner) in seen:
+            raise RuntimeError(
+                "ApplyHyperFlow: time_embedder.forward carries a HyperFlow patch "
+                "this install cannot unwrap (stale wrapper from an older version?). "
+                "Restart ComfyUI and re-run the workflow.")
+        seen.add(id(forward))
+        forward = inner
     return forward
 
 
@@ -198,7 +220,10 @@ def make_ctx_wrapper(shared, dm, grid, label, verbose):
 def install_two_time(new_model, weights, gate_override=None, verbose=False):
     """Install the two-time embedder on a cloned patcher: the forward-attribute
     patch on time_embedder plus the DIFFUSION_MODEL context wrapper. Idempotence
-    guard: chaining ApplyHyperFlow twice is rejected."""
+    guard: chaining ApplyHyperFlow twice on one patcher is rejected. Applying on
+    a FRESH clone while a previous scene's patch is still resident on the shared
+    module is legal (context loops): the live module forward is unwrapped back
+    to the true original before the new wrapper captures it."""
     dm = new_model.get_model_object("diffusion_model")
     te = getattr(dm, "time_embedder", None)
     if te is None:
@@ -210,6 +235,10 @@ def install_two_time(new_model, weights, gate_override=None, verbose=False):
     patch_key = "diffusion_model.time_embedder.forward"
     if getattr(new_model.object_patches.get(patch_key), "_hyperflow_two_time", False):
         raise RuntimeError("This MODEL already has HyperFlow applied; chain it once.")
+    # The module attribute may still carry a wrapper from a previous scene's
+    # clone (shared inner model, dynamic-VRAM loops keep it resident): capture
+    # the true original forward, never a previous HyperFlow wrapper.
+    base_forward = _unwrap_two_time(te.forward)
 
     gate = weights.metadata.gate if gate_override is None else float(gate_override)
     shared: dict = {}
@@ -218,7 +247,7 @@ def install_two_time(new_model, weights, gate_override=None, verbose=False):
         te, weights.endpoint,
         {"proj_in": weights.metadata.lora_alpha, "proj_out": weights.metadata.lora_alpha},
         cache)
-    forward = make_two_time_forward(te.forward, endpoint_forward, gate, shared)
+    forward = make_two_time_forward(base_forward, endpoint_forward, gate, shared)
     new_model.add_object_patch(patch_key, forward)
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "hyperflow_two_time",

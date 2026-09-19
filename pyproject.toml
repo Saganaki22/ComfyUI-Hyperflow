@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-hyperflow"
-version = "1.1.0"
+version = "1.2.0"
 description = "HyperFlow: 8-step LoRA + two-time (t, r) conditioning for MiniMax-H3"
 license = { file = "LICENSE" }
 dependencies = []

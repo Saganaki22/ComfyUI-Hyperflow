@@ -44,6 +44,37 @@ _LAYOUT_ERROR = (
     "models/hyperflow/. The original file stays untouched on disk; convert "
     "it yourself with tools/convert_hyperflow.py if needed.")
 
+#: the standalone builds from the MiniMax-H3-Turbo-Lora-ComfyUI repo wrap the
+#: same weights as a GENERIC ComfyUI LoRA: every key carries a
+#: `diffusion_model.` prefix and a per-module `.alpha` scalar. Those load with
+#: the stock Load LoRA node -- this node deliberately does not (their per-module
+#: alpha / fc1 row-swap / dropped endpoint differ from the node build).
+_GENERIC_LORA_ERROR = (
+    "{name} is a standalone/generic ComfyUI LoRA (keys like "
+    "'diffusion_model.<module>.lora_A.weight' and '.alpha'), not the HyperFlow "
+    "node build. Two options:\n"
+    "  1. Use it with the stock 'Load LoRA' node (move it to models/loras/) -- "
+    "backbone only, no two-time conditioning.\n"
+    "  2. For this node, download the node build '{node_full}' (or "
+    "'{node_pruned}' if your MiniMax-H3 base is pruned/curve) from "
+    "https://huggingface.co/drbaph/Hyperflow-Comfyui into models/hyperflow/ -- "
+    "or tick download_if_missing and let the node fetch it.")
+
+
+def _node_build_names() -> tuple[str, str]:
+    """The published node-build file names, manifest-driven with a hardcoded
+    fallback so error text stays helpful even if assets/ were stripped."""
+    names = {}
+    for variant, manifest in (("full", BUNDLED_MANIFEST_FULL),
+                              ("pruned", BUNDLED_MANIFEST_PRUNED)):
+        try:
+            names[variant] = _manifest_default(manifest)
+        except (ValueError, OSError, json.JSONDecodeError, FileNotFoundError):
+            names[variant] = ("custom_node_hyperflow_8step_v1.0_comfyui"
+                              + ("_pruned" if variant == "pruned" else "")
+                              + ".safetensors")
+    return names["full"], names["pruned"]
+
 
 @dataclass(frozen=True)
 class HyperFlowMetadata:
@@ -251,6 +282,10 @@ def load_weights(path_or_name: str | os.PathLike) -> HyperFlowWeights:
         keys = list(handle.keys())
         if any(KEY_RE.match(k) is not None for k in keys):
             raise RuntimeError(_LAYOUT_ERROR.format(path=path))
+        if any(k.startswith("diffusion_model.") or k.endswith(".alpha") for k in keys):
+            node_full, node_pruned = _node_build_names()
+            raise RuntimeError(_GENERIC_LORA_ERROR.format(
+                name=path.name, node_full=node_full, node_pruned=node_pruned))
         plan = plan_from_keys(keys)     # converted layout only, validated
         metadata = HyperFlowMetadata.from_dict(handle.metadata())
         tensors = {key: handle.get_tensor(key) for key in keys}

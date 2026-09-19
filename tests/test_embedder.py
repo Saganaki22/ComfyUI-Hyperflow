@@ -18,8 +18,8 @@ import comfy.model_management
 from comfy.ldm.minimax.model import (AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP,
                                      TimeEmbedder, time_shift_sigma)
 
-from hyperflow_h3.embedder import (make_ctx_wrapper, make_endpoint_forward,
-                                   make_two_time_forward)
+from hyperflow_h3.embedder import (install_two_time, make_ctx_wrapper,
+                                   make_endpoint_forward, make_two_time_forward)
 from hyperflow_h3.schedule import DEFAULT_SIGMAS_8STEP, video_schedule_sigmas
 
 comfy.model_management.get_torch_device = lambda: torch.device("cpu")
@@ -239,6 +239,104 @@ def test_wrapper_full_loop_matches_reference_formula():
     t_emb = te.forward(t_vals)
     want = t_emb + GATE * (_manual_endpoint(te, endpoint, r) - t_emb)
     assert torch.allclose(captured["out"], want, atol=1e-5)
+
+
+class _FakeMetadata:
+    def __init__(self, gate):
+        self.gate = gate
+        self.lora_alpha = ALPHA
+        self.sigmas = DEFAULT_SIGMAS_8STEP
+        self.version = "test"
+
+
+class _FakeWeights:
+    def __init__(self, endpoint, gate):
+        self.endpoint = endpoint
+        self.metadata = _FakeMetadata(gate)
+
+
+class _FakePatcher:
+    """The bits of ModelPatcher install_two_time touches: shared dm across
+    clones, per-patcher object_patches / wrappers."""
+
+    def __init__(self, dm):
+        self._dm = dm
+        self.object_patches = {}
+        self.wrappers = []
+
+    def get_model_object(self, name):
+        assert name == "diffusion_model"
+        return self._dm
+
+    def add_object_patch(self, key, value):
+        self.object_patches[key] = value
+
+    def add_wrapper_with_key(self, wmp, key, wrapper):
+        self.wrappers.append(wrapper)
+
+
+def test_reinstall_on_fresh_clone_unwraps_resident_patch():
+    """Regression (context loops): scene 1's patch stays resident on the shared
+    time_embedder module when scene 2 applies HyperFlow on a fresh clone. The
+    second install must capture the ORIGINAL forward -- wrapping scene 1's
+    wrapper would leave the inner one bound to scene 1's cleared step context
+    and fail with 'ran without step context' on the first sample step."""
+    te = _embedder()
+    dm = type("DM", (), {"time_embedder": te,
+                         "sigma_shift_video": 12.0,
+                         "sigma_shift_audio": 3.0})()
+    original_forward = te.forward
+
+    # scene 1: install, then ComfyUI's patch_model applies the patch live
+    scene1 = _FakePatcher(dm)
+    install_two_time(scene1, _FakeWeights(_endpoint_tensors(seed=1), GATE))
+    te.forward = scene1.object_patches["diffusion_model.time_embedder.forward"]
+    assert getattr(te.forward, "_hyperflow_two_time", False)
+
+    # scene 2: fresh clone, empty object_patches, module still patched
+    scene2 = _FakePatcher(dm)
+    gate2, endpoint2 = 0.6, _endpoint_tensors(seed=2)
+    install_two_time(scene2, _FakeWeights(endpoint2, gate2))
+    patched2 = scene2.object_patches["diffusion_model.time_embedder.forward"]
+    # the new wrapper sits on the ORIGINAL forward, not on scene 1's wrapper
+    assert patched2._hyperflow_base_forward == original_forward
+    te.forward = patched2
+
+    # scene 2 samples through its own ctx wrapper: no stale-context error,
+    # and the result follows scene 2's gate/endpoint, not scene 1's
+    grid = video_schedule_sigmas(DEFAULT_SIGMAS_8STEP)
+    sigma_v = float(grid[3])
+    captured = {}
+
+    def executor(*args, **kwargs):
+        t_v = 1.0 - sigma_v
+        t_a = 1.0 - float(time_shift_sigma(torch.tensor(sigma_v), 12.0, 3.0))
+        captured["out"] = te.forward(torch.tensor(sorted({t_v, t_a})))
+        return "ok"
+
+    scene2.wrappers[0](executor, None, torch.tensor([sigma_v * 1000.0]), None,
+                       {"sample_sigmas": grid}, minimax_payload={})
+    assert captured["out"] is not None
+    ctx = _ctx_for(None, sigma_v, grid)
+    t_vals = torch.tensor(sorted({ctx["t_v"], ctx["t_a"]}))
+    r = torch.where(t_vals == ctx["t_v"], torch.full_like(t_vals, ctx["r_v"]),
+                    torch.full_like(t_vals, ctx["r_a"]))
+    t_emb = original_forward(t_vals)
+    want = t_emb + gate2 * (_manual_endpoint(te, endpoint2, r) - t_emb)
+    assert torch.allclose(captured["out"], want, atol=1e-5)
+
+
+def test_chaining_twice_on_one_patcher_still_rejected():
+    te = _embedder()
+    dm = type("DM", (), {"time_embedder": te})()
+    patcher = _FakePatcher(dm)
+    install_two_time(patcher, _FakeWeights(_endpoint_tensors(), GATE))
+    try:
+        install_two_time(patcher, _FakeWeights(_endpoint_tensors(), GATE))
+    except RuntimeError as e:
+        assert "chain it once" in str(e)
+    else:
+        raise AssertionError("expected double-apply on one patcher to be rejected")
 
 
 if __name__ == "__main__":
